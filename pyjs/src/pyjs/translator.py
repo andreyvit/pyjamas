@@ -367,6 +367,11 @@ def mod_var_name_decl(raw_module_name):
     child_name = name[-1]
     return "var %s = %s;\n" % (child_name, raw_module_name)
 
+class FakeNode(object):
+    def __init__(self, **kw):
+        for k, v in kw.iteritems():
+            setattr(self, k, v)
+
 class Translator:
 
     decorator_compiler_options = {\
@@ -585,6 +590,7 @@ class Translator:
     def parse_decorators(self, node):
         staticmethod = False
         classmethod = False
+        decorators = []
         for d in node.decorators:
             if isinstance(d, ast.Getattr):
                 if isinstance(d.expr, ast.Name):
@@ -596,23 +602,50 @@ class Translator:
                             raise TranslationError(
                                 "Unknown compiler option '%s'" % d.attrname, node, self.module_name)
                     else:
-                        raise TranslationError(
-                            "Unknown decorator '%s'" % d.attrname, node, self.module_name)
+                        decorators.append(d)
                 else:
-                    raise TranslationError(
-                        "Unknown decorator '%s'" % d.attrname, node, self.module_name)
+                    decorators.append(d)
             elif isinstance(d, ast.Name):
                 if d.name == 'staticmethod':
                     staticmethod = True
                 elif d.name == 'classmethod':
                     classmethod = True
                 else:
-                    raise TranslationError(
-                        "Unknown decorator '%s'" % d.name, node, self.module_name)
+                    decorators.append(d)
             else:
-                raise TranslationError(
-                    "Unknown decorator '%s'" % d, node, self.module_name)
-        return (staticmethod, classmethod)
+                decorators.append(d)
+        return (staticmethod, classmethod, decorators)
+
+    def process_decorators(self, decorators, current_klass, function_name, local_prefix):
+        if not decorators:
+            return
+        
+        name = (local_prefix + '.' + function_name if local_prefix else function_name)
+        decorated_name = name + '__decorated'
+        expression = name
+        for decorator in reversed(decorators):
+            expression = self.expr(decorator, current_klass) + '(' + expression + ')'
+        print >>self.output, self.spacing() + decorated_name + " = " + expression + ";"
+        
+        fake_node = FakeNode(defaults=[], varargs=True, kwargs=True)
+        
+        # create a wrapper function that would turn "this" into a real argument
+        # (it would be better to handle this elsewhere because the same problem
+        # occurs when monkey-patching Python classes: a global function that's
+        # turned into a bound method does not recognize "this" as a first arg)
+        if current_klass is None:
+            print >>self.output, self.indent() + name + " = function() {";
+            self._static_method_init(fake_node, [], 'args', 'kw', current_klass)
+            print >>self.output, self.spacing() + "return pyjs_kwargs_call(null, %s, args, kw, [{}]);" % decorated_name
+            print >>self.output, self.dedent() + "};";
+            print >>self.output, self.spacing() + "%s.__name__ = '%s';\n" % (name, name)
+            self.func_args(fake_node, name, 'static', [], 'args', 'kw')
+        else:
+            print >>self.output, self.indent() + name + " = pyjs__bind_method(cls_instance, '"+function_name+"', function() {";
+            self._instance_method_init(fake_node, [], 'args', 'kw', current_klass)
+            print >>self.output, self.spacing() + "return pyjs_kwargs_call(null, %s, args, kw, [{}]);" % decorated_name
+            print >>self.output, self.dedent() + "}";
+            self.func_args(fake_node, None, 'bound', [], 'args', 'kw')
 
     def remap_regex(self, re_list, *words):
         dbg = 0
@@ -1058,15 +1091,20 @@ var %s = arguments.length >= %d ? arguments[arguments.length-1] : arguments[argu
             start -= 1
         else:
             end = "arguments.length"
+        if start == -1:
+            this_clause = "%(s)sif (this) %(v)s.push(this);\n" % {'s': self.spacing(), 'v': varargname}
+            start = 0
+        else:
+            this_clause = ''
         print >> self.output, """\
-%(s)svar %(v)s = new Array();
+%(s)svar %(v)s = new Array();%(this)s
 %(s)sfor (var pyjs__va_arg = %(b)d; pyjs__va_arg < %(e)s; pyjs__va_arg++) {
 %(s)s\tvar pyjs__arg = arguments[pyjs__va_arg];
 %(s)s\t%(v)s.push(pyjs__arg);
 %(s)s}
 %(s)s%(v)s = pyjslib.Tuple(%(v)s);
 \
-""" % {'s': self.spacing(), 'v': varargname, 'b': start, 'e': end}
+""" % {'s': self.spacing(), 'v': varargname, 'b': start, 'e': end, 'this': this_clause}
 
     def __varargs_handler(self, node, varargname, arg_names, current_klass, loop_var = None):
         print >>self.output, self.spacing() + "var", varargname, '= new pyjslib.Tuple();'
@@ -1241,7 +1279,9 @@ var %s = arguments.length >= %d ? arguments[arguments.length-1] : arguments[argu
         save_has_js_return = self.has_js_return
         self.has_js_return = False
         if node.decorators:
-            self.parse_decorators(node)
+            dummy, dummy, decorators = self.parse_decorators(node)
+        else:
+            decorators = []
 
         if local:
             function_name = node.name
@@ -1320,6 +1360,8 @@ var %s = arguments.length >= %d ? arguments[arguments.length-1] : arguments[argu
         self.has_js_return = save_has_js_return
         self.pop_options()
         self.pop_lookup()
+        
+        self.process_decorators(decorators, None, function_name, None)
 
 
     def _return(self, node, current_klass):
@@ -1714,9 +1756,9 @@ var %(e)s_name = (typeof %(e)s.__name__ == 'undefined' ? %(e)s.name : %(e)s.__na
         save_has_js_return = self.has_js_return
         self.has_js_return = False
         if node.decorators:
-            staticmethod, classmethod = self.parse_decorators(node)
+            staticmethod, classmethod, decorators = self.parse_decorators(node)
         else:
-            staticmethod = classmethod = False
+            staticmethod, classmethod, decorators = False, False, []
 
         if node.name == '__new__':
             staticmethod = True
@@ -1808,6 +1850,8 @@ var %(e)s_name = (typeof %(e)s.__name__ == 'undefined' ? %(e)s.name : %(e)s.__na
         self.has_js_return = save_has_js_return
         self.pop_options()
         self.pop_lookup()
+        
+        self.process_decorators(decorators, current_klass, method_name, local_prefix)
 
     def _isNativeFunc(self, node):
         if isinstance(node, ast.Discard):
